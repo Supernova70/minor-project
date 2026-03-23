@@ -17,7 +17,7 @@ build/
 
 # Data
 uploads/
-*.joblib
+
 
 # Docker
 docker-compose.override.yml
