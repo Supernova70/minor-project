@@ -5,17 +5,21 @@ Email phishing detection system with ML-based text analysis, URL scanning, and a
 ## Quick Start
 
 ```bash
-# 1. Copy and configure environment
+# 1. Download datasets from Kaggle
+# Download CEAS_08.csv and phishing_email.csv from Kaggle
+# Place them in: data/archive/
+
+# 2. Copy and configure environment
 cp .env.example .env
 # Edit .env with your credentials
 
-# 2. Start with Docker
+# 3. Start with Docker
 docker-compose up --build
 
-# 3. Check health
+# 4. Check health
 curl http://localhost:8000/health
 
-# 4. View API docs
+# 5. View API docs
 # Open http://localhost:8000/docs
 ```
 
