@@ -21,6 +21,7 @@ class Settings(BaseSettings):
 
     # ── Database ─────────────────────────────────────────
     DATABASE_URL: str = "postgresql://phishing_user:phishing_pass@postgres:5432/phishing_guard"
+    REDIS_URL: str = "redis://redis:6379/0"
 
     # ── VirusTotal ───────────────────────────────────────
     VIRUSTOTAL_API_KEYS: str = ""  # Comma-separated keys
@@ -29,6 +30,9 @@ class Settings(BaseSettings):
     def vt_api_keys(self) -> List[str]:
         """Parse comma-separated VT keys into a list."""
         return [k.strip() for k in self.VIRUSTOTAL_API_KEYS.split(",") if k.strip()]
+
+    # ── Security ─────────────────────────────────────────
+    API_KEYS: str = ""   # comma-separated list of valid keys
 
     # ── Email (IMAP) ─────────────────────────────────────
     EMAIL_HOST: str = "imap.gmail.com"

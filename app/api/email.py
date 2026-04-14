@@ -41,14 +41,35 @@ async def fetch_emails(
 
 @router.get("", response_model=EmailListResponse)
 async def list_emails(
+    sender: str = Query(None),
+    has_attachments: bool = Query(None),
+    date_from: str = Query(None),
+    date_to: str = Query(None),
+    scanned: bool = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
     """List all fetched emails with pagination."""
-    total = db.query(Email).count()
+    query = db.query(Email)
+    
+    if sender:
+        query = query.filter(Email.sender.ilike(f"%{sender}%"))
+    if has_attachments is not None:
+        query = query.filter(Email.has_attachments == has_attachments)
+    if date_from:
+        query = query.filter(Email.fetched_at >= date_from)
+    if date_to:
+        query = query.filter(Email.fetched_at <= date_to)
+    if scanned is not None:
+        if scanned:
+            query = query.filter(Email.scans.any())
+        else:
+            query = query.filter(~Email.scans.any())
+            
+    total = query.count()
     emails = (
-        db.query(Email)
+        query
         .order_by(Email.fetched_at.desc())
         .offset(skip)
         .limit(limit)

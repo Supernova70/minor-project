@@ -1,7 +1,7 @@
 """Scan and Verdict ORM models."""
 
 from datetime import datetime
-from typing import Optional, Any
+from typing import Optional, Any, List
 
 from sqlalchemy import String, Integer, Float, ForeignKey, DateTime, JSON, Enum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -45,6 +45,9 @@ class Scan(Base):
     email: Mapped["Email"] = relationship(back_populates="scans")  # type: ignore[name-defined]
     verdict: Mapped[Optional["Verdict"]] = relationship(
         back_populates="scan", uselist=False, cascade="all, delete-orphan"
+    )
+    url_results: Mapped[List["UrlResult"]] = relationship(  # type: ignore[name-defined]
+        back_populates="scan", cascade="all, delete-orphan"
     )
 
     def to_dict(self) -> dict:

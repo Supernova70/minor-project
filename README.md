@@ -54,3 +54,17 @@ app/
 - **Alembic** — Migrations
 - **scikit-learn** — ML model
 - **Docker** — Containerization
+
+## Database Migration Setup
+
+If you have an existing database that was created before Alembic was added
+(i.e., tables were created by create_all() rather than migrations), run
+this ONE TIME to register the current state with Alembic:
+
+  docker-compose exec phishing-guard alembic stamp 0001
+
+After that, all future schema changes are handled automatically by:
+
+  alembic upgrade head
+
+which runs on every container start.

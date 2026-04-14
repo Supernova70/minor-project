@@ -14,6 +14,7 @@ from app.config import get_settings
 from app.api.router import api_router
 from app.models import Base
 from app.dependencies import engine
+from app.middleware.auth import ApiKeyMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +26,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
 
     # Create tables if they don't exist (Alembic handles migrations in prod)
-    Base.metadata.create_all(bind=engine)
-    logger.info("Database tables verified")
+    logger.info("Schema managed by Alembic — run: alembic upgrade head")
 
     yield
 
@@ -46,6 +46,8 @@ def create_app() -> FastAPI:
 
     # Mount API routes
     app.include_router(api_router)
+    
+    app.add_middleware(ApiKeyMiddleware)
 
     return app
 

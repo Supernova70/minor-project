@@ -18,6 +18,8 @@ from app.models import Base
 # Import all models so Alembic can detect them
 from app.models.email import Email, Attachment  # noqa: F401
 from app.models.scan import Scan, Verdict  # noqa: F401
+from app.models.fetch_state import FetchState  # noqa: F401
+from app.models.url_result import UrlResult  # noqa: F401
 
 config = context.config
 

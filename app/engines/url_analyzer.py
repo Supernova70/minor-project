@@ -1,0 +1,312 @@
+import base64
+import json
+import logging
+import math
+import os
+import re
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import List, Optional, Set, Tuple
+from urllib.parse import urlparse, unquote
+
+import httpx
+from bs4 import BeautifulSoup
+
+from app.config import get_settings
+from app.cache import get_redis
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class UrlAnalysisResult:
+    original_url: str
+    normalized_url: Optional[str]
+    is_shortener: bool = False
+    heuristic_score: float = 0.0
+    vt_score: float = 0.0
+    final_score: float = 0.0
+    vt_malicious: int = 0
+    vt_suspicious: int = 0
+    vt_harmless: int = 0
+    vt_total: int = 0
+    vt_error: Optional[str] = None
+    heuristic_flags: List[str] = field(default_factory=list)
+
+@dataclass
+class UrlEngineResult:
+    url_score: float
+    total_urls: int
+    analyzed_urls: int
+    vt_checked_urls: int
+    high_risk_urls: List[str]
+    per_url_results: List[UrlAnalysisResult]
+
+class UrlAnalyzer:
+    """Engine for extracting, scoring, and looking up URLs in email bodies."""
+
+    def __init__(self):
+        settings = get_settings()
+        self._vt_keys = settings.vt_api_keys
+        self._vt_key_index = 0
+
+    def analyze(self, body_text: Optional[str], body_html: Optional[str]) -> UrlEngineResult:
+        urls = self._extract_and_deduplicate(body_text or "", body_html or "")
+        
+        results = []
+        vt_checked = 0
+        
+        for original, normalized in urls:
+            result = self._score_heuristic(original, normalized)
+            
+            # VirusTotal lookup
+            if self._vt_keys:
+                self._check_virustotal(result)
+                vt_checked += 1
+            
+            # Aggregate final score
+            result.final_score = min(100.0, max(result.heuristic_score, result.vt_score))
+            results.append(result)
+
+        engine_score = max((r.final_score for r in results), default=0.0)
+        high_risk = [r.original_url for r in results if r.final_score >= 60.0]
+
+        return UrlEngineResult(
+            url_score=engine_score,
+            total_urls=len(urls),
+            analyzed_urls=len(urls),
+            vt_checked_urls=vt_checked,
+            high_risk_urls=high_risk,
+            per_url_results=results,
+        )
+
+    # ── STAGE 1: Target Extraction ────────────────────────────────────────――
+    
+    def _extract_and_deduplicate(self, body_text: str, body_html: str) -> List[Tuple[str, str]]:
+        raw_urls = set()
+        
+        # From text
+        text_regex = re.compile(r'https?://[^\s"\'<>]+', re.IGNORECASE)
+        raw_urls.update(text_regex.findall(body_text))
+        
+        # From HTML
+        if body_html:
+            soup = BeautifulSoup(body_html, "html.parser")
+            for tag in soup.find_all(href=True):
+                raw_urls.add(tag['href'])
+            for tag in soup.find_all(src=True):
+                raw_urls.add(tag['src'])
+            for tag in soup.find_all(action=True):
+                raw_urls.add(tag['action'])
+            
+            text_nodes = soup.get_text(separator=" ")
+            raw_urls.update(text_regex.findall(text_nodes))
+        
+        filtered = []
+        seen_normalized = set()
+        
+        for url in raw_urls:
+            url = url.strip()
+            if not url.lower().startswith("http"):
+                continue
+                
+            normalized = self._normalize(url)
+            if not normalized or self._is_local_ip(normalized):
+                continue
+                
+            if normalized not in seen_normalized:
+                seen_normalized.add(normalized)
+                filtered.append((url, normalized))
+                
+        return filtered
+
+    def _normalize(self, url: str) -> str:
+        try:
+            url = unquote(url).strip()
+            parsed = urlparse(url)
+            scheme = parsed.scheme.lower()
+            host = parsed.netloc.lower()
+            
+            # Strip tracking
+            query = []
+            tracking_prefixes = ("utm_", "fbclid", "gclid", "ref", "mc_")
+            if parsed.query:
+                for param in parsed.query.split("&"):
+                    if not param.lower().startswith(tracking_prefixes):
+                        query.append(param)
+            
+            new_query = "&".join(query)
+            clean_url = f"{scheme}://{host}{parsed.path}"
+            if new_query:
+                clean_url += f"?{new_query}"
+            
+            return clean_url
+        except Exception:
+            return url
+
+    def _is_local_ip(self, url: str) -> bool:
+        try:
+            host = urlparse(url).netloc.split(":")[0].lower()
+            if host in ("localhost", "127.0.0.1", "0.0.0.0"):
+                return True
+            if host.startswith("10.") or host.startswith("192.168."):
+                return True
+            if re.match(r"^172\.(1[6-9]|2[0-9]|3[0-1])\.", host):
+                return True
+            return False
+        except Exception:
+            return False
+
+    # ── STAGE 2: Static Heuristic Scoring ─────────────────────────────────――
+    
+    def _score_heuristic(self, original_url: str, normalized_url: str) -> UrlAnalysisResult:
+        res = UrlAnalysisResult(original_url=original_url, normalized_url=normalized_url)
+        score = 0.0
+        parsed = urlparse(normalized_url)
+        hostname = parsed.netloc.split(":")[0]
+        
+        # Check 1: HTTP scheme (+15)
+        if parsed.scheme == "http":
+            score += 15
+            res.heuristic_flags.append("Unencrypted HTTP connection")
+            
+        # Check 2: IP hostname (+35)
+        if re.match(r'^(\d{1,3}\.){3}\d{1,3}$', hostname):
+            score += 35
+            res.heuristic_flags.append(f"IP address used as hostname: {hostname}")
+
+        parts = hostname.split('.')
+        tld = f".{parts[-1]}" if len(parts) > 1 else ""
+        registered_domain = ".".join(parts[-2:]) if len(parts) >= 2 else hostname
+        
+        # Check 3: Suspicious TLD (+20)
+        suspicious_tlds = {
+            ".tk",".ml",".ga",".cf",".gq",".xyz",".top",".click",".work",
+            ".site",".online",".live",".link",".bid",".win",".download",
+            ".loan",".gdn",".rest",".bar"
+        }
+        if tld in suspicious_tlds:
+            score += 20
+            res.heuristic_flags.append(f"High-risk TLD: {tld}")
+
+        # Check 4: URL shortener (+20)
+        shorteners = {
+            "bit.ly","tinyurl.com","t.co","ow.ly","goo.gl","short.link",
+            "rebrand.ly","cutt.ly","is.gd","buff.ly","tiny.cc","adf.ly"
+        }
+        if registered_domain in shorteners:
+            score += 20
+            res.is_shortener = True
+            res.heuristic_flags.append(f"URL shortener detected: {registered_domain}")
+
+        # Check 5: Brand impersonation (+40)
+        brands = [
+            (r"paypa[l1]", "paypal.com"),
+            (r"g[o0]{2}gle", "google.com"),
+            (r"amaz[o0]n", "amazon.com"),
+            (r"[a4]pp[l1]e", "apple.com"),
+            (r"micr[o0]s[o0]ft", "microsoft.com"),
+            (r"netfl[i1]x", "netflix.com"),
+            (r"fac[e3]b[o0]{2}k", "facebook.com"),
+            (r"ch[a4]se", "chase.com"),
+            (r"we[l1]{2}sfarg[o0]", "wellsfargo.com"),
+        ]
+        brand_matched = False
+        for pattern, real_domain in brands:
+            if re.search(pattern, hostname) and registered_domain != real_domain:
+                match_str = re.search(pattern, hostname).group(0)
+                score += 40
+                res.heuristic_flags.append(f"Brand impersonation: '{match_str}' in host but domain is '{registered_domain}'")
+                brand_matched = True
+                break
+
+        # Check 6: Excessive subdomains (+15)
+        if len(parts) >= 4 and not brand_matched:
+            score += 15
+            res.heuristic_flags.append(f"Excessive subdomains ({len(parts)} levels): {hostname}")
+
+        # Check 7: Long URL (+10)
+        if len(original_url) > 200:
+            score += 10
+            res.heuristic_flags.append(f"Unusually long URL ({len(original_url)} chars)")
+
+        # Check 8: High path entropy (+15)
+        path = parsed.path
+        if path and len(path) > 10:
+            counts = Counter(path)
+            entropy = -sum((c/len(path)) * math.log2(c/len(path)) for c in counts.values())
+            if entropy > 4.5:
+                score += 15
+                res.heuristic_flags.append(f"High-entropy path (entropy={entropy:.2f}) — possible obfuscation")
+
+        # Check 9: @ symbol in URL (+25)
+        if "@" in parsed.netloc:
+            score += 25
+            res.heuristic_flags.append("@ symbol in URL — credential obfuscation pattern")
+
+        # Check 10: Redirect encoded (+20)
+        if original_url.lower().count("http") > 1:
+            score += 20
+            res.heuristic_flags.append("URL contains embedded redirect")
+
+        res.heuristic_score = min(score, 100.0)
+        return res
+
+    # ── STAGE 3: VirusTotal Lookup ────────────────────────────────────────――
+    
+    def _check_virustotal(self, result: UrlAnalysisResult) -> None:
+        url_id = base64.urlsafe_b64encode(result.normalized_url.encode()).decode().rstrip("=")
+        cache_key = f"vt:url:{url_id}"
+        
+        # Check cache
+        r = get_redis()
+        if r:
+            cached = r.get(cache_key)
+            if cached:
+                try:
+                    data = json.loads(cached)
+                    self._apply_vt_stats(result, data)
+                    return
+                except Exception:
+                    pass
+
+        api_key = self._vt_keys[self._vt_key_index]
+        self._vt_key_index = (self._vt_key_index + 1) % len(self._vt_keys)
+        
+        headers = {"x-apikey": api_key}
+        
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.get(f"https://www.virustotal.com/api/v3/urls/{url_id}", headers=headers)
+                
+                if resp.status_code == 200:
+                    data = resp.json()["data"]["attributes"]["last_analysis_stats"]
+                    self._apply_vt_stats(result, data)
+                    
+                    if r:
+                        r.setex(cache_key, 86400, json.dumps(data))
+                        
+                elif resp.status_code == 404:
+                    result.vt_error = "Submitted to VT — not yet analyzed"
+                    # Submit for analysis
+                    client.post("https://www.virustotal.com/api/v3/urls", data={"url": result.normalized_url}, headers=headers)
+                elif resp.status_code == 429:
+                    result.vt_error = "VT rate limit — heuristic score only"
+                else:
+                    logger.warning(f"VT Error {resp.status_code} for {result.normalized_url}")
+                    result.vt_error = f"VT HTTP Error {resp.status_code}"
+                
+        except Exception as e:
+            logger.warning(f"VT request failed: {e}")
+            result.vt_error = "VT connection failed"
+
+    def _apply_vt_stats(self, result: UrlAnalysisResult, stats: dict) -> None:
+        result.vt_malicious = stats.get("malicious", 0)
+        result.vt_suspicious = stats.get("suspicious", 0)
+        result.vt_harmless = stats.get("harmless", 0)
+        result.vt_total = sum(stats.values())
+        
+        if result.vt_total > 0:
+            result.vt_score = min(100.0, (result.vt_malicious + result.vt_suspicious * 0.5) / result.vt_total * 100.0)
+            
+        if result.vt_malicious > 0:
+            result.heuristic_flags.insert(0, f"VT found {result.vt_malicious} malicious reports")

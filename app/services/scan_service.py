@@ -12,8 +12,10 @@ from sqlalchemy.orm import Session
 
 from app.models.email import Email
 from app.models.scan import Scan, Verdict, ScanStatus, Classification
+from app.models.url_result import UrlResult
 from app.engines.text_analyzer import get_text_analyzer
 from app.engines.attachment_analyzer import AttachmentAnalyzer
+from app.engines.url_analyzer import UrlAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +25,38 @@ class ScanService:
 
     def __init__(self, db: Session):
         self.db = db
+        
+    def run_scan_by_id(self, scan_id: int) -> Optional[Scan]:
+        """Load an existing scan and execute it."""
+        scan = self.db.query(Scan).filter(Scan.id == scan_id).first()
+        if not scan:
+            return None
+            
+        email = scan.email
+        if not email:
+            scan.status = ScanStatus.ERROR.value
+            self.db.commit()
+            return scan
+            
+        scan.status = ScanStatus.RUNNING.value
+        scan.started_at = datetime.utcnow()
+        self.db.commit()
+        return self._execute_pipeline(scan, email)
 
     def run_scan(self, email: Email) -> Scan:
+        """Create a scan and execute it immediately."""
+        scan = Scan(
+            email_id=email.id,
+            status=ScanStatus.RUNNING.value,
+            started_at=datetime.utcnow(),
+        )
+        self.db.add(scan)
+        self.db.flush()
+        return self._execute_pipeline(scan, email)
+        
+    def _execute_pipeline(self, scan: Scan, email: Email) -> Scan:
         """
+        Execute the full email analysis pipeline.
         Execute a full scan on an email.
 
         Runs:
@@ -35,15 +66,7 @@ class ScanService:
         Future engines:
             3. URL Analysis        → url_score         (not yet wired)
         """
-        # Create scan record
-        scan = Scan(
-            email_id=email.id,
-            status=ScanStatus.RUNNING.value,
-            started_at=datetime.utcnow(),
-        )
-        self.db.add(scan)
-        self.db.flush()
-
+        """
         try:
             # ── 1. ML Text Analysis ──────────────────────
             text_analyzer = get_text_analyzer()
@@ -55,8 +78,31 @@ class ScanService:
             ai_score = ai_result.confidence
             ai_label = ai_result.label
 
-            # ── 2. URL Analysis (placeholder) ──────────────────
-            url_score = 0.0
+            # ── 2. URL Analysis ──────────────────
+            url_analyzer = UrlAnalyzer()
+            text = email.body_text or ""
+            html = email.body_html or ""
+            url_result = url_analyzer.analyze(text, html)
+            url_score = url_result.url_score
+            
+            # Persist each URL result row
+            for ur in url_result.per_url_results:
+                db_url = UrlResult(
+                    scan_id=scan.id,
+                    original_url=ur.original_url,
+                    normalized_url=ur.normalized_url,
+                    is_shortener=ur.is_shortener,
+                    heuristic_score=ur.heuristic_score,
+                    vt_score=ur.vt_score,
+                    final_score=ur.final_score,
+                    vt_malicious=ur.vt_malicious,
+                    vt_suspicious=ur.vt_suspicious,
+                    vt_harmless=ur.vt_harmless,
+                    vt_total=ur.vt_total,
+                    vt_error=ur.vt_error,
+                    heuristic_flags=ur.heuristic_flags,
+                )
+                self.db.add(db_url)
 
             # ── 3. Attachment Analysis ─────────────────────────
             attachment_analyzer = AttachmentAnalyzer()
@@ -85,7 +131,22 @@ class ScanService:
                         "label": ai_label,
                         "is_phishing": ai_result.is_phishing,
                     },
-                    "url": {"score": url_score, "note": "Not yet implemented"},
+                    "url": {
+                        "score": url_score,
+                        "total_urls": url_result.total_urls,
+                        "analyzed_urls": url_result.analyzed_urls,
+                        "vt_checked_urls": url_result.vt_checked_urls,
+                        "high_risk_urls": url_result.high_risk_urls,
+                        "per_url": [
+                            {
+                                "url": u.original_url,
+                                "score": u.final_score,
+                                "vt_malicious": u.vt_malicious,
+                                "top_flags": u.heuristic_flags[:3] if u.heuristic_flags else []
+                            }
+                            for u in url_result.per_url_results
+                        ]
+                    },
                     "attachment": {
                         "score": att_result.attachment_score,
                         "total_files": att_result.total_files,
@@ -106,7 +167,7 @@ class ScanService:
 
             logger.info(
                 f"Scan {scan.id} complete: "
-                f"score={final_score:.1f}, class={classification}"
+                f"ai={ai_score:.1f} url={url_score:.1f} att={attachment_score:.1f} → final={final_score:.1f} ({classification})"
             )
             return scan
 
